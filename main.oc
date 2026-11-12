@@ -1,0 +1,170 @@
+package main;
+import "term/tui";
+import "io";
+import "os";
+extern *void popen(buffer<i8> command, buffer<i8> mode);
+extern i32 pclose(*void stream);
+extern i32 fgetc(*void stream);
+
+func quote(s string) string {
+    out := "'";
+    for (_, c := range s) { if (c == 39) out += "'\\''"; else { b := i8[]{c}; out += b -> string; } }
+    return out + "'";
+}
+struct Reply { text string; code int; }
+func git(args string) Reply {
+    command := "git --no-pager -c color.ui=false " + args + " 2>&1\0";
+    stream := extern.popen(command.data, "r\0".data);
+    if (stream == null) return Reply{"Cannot start Git", 1};
+    bytes := i8[]{};
+    for (;;) { c := extern.fgetc(stream); if (c < 0) break; bytes.append(c -> i8); }
+    code := extern.pclose(stream);
+    return Reply{bytes -> string, code};
+}
+func lines(s string) string[] {
+    result := string[]{}; current := "";
+    for (_, c := range s) { if (c == 10) { result.append(current); current = ""; } else if (c >= 32 || c == 9) { b := i8[]{c}; current += b -> string; } }
+    if (current != "") result.append(current);
+    return result;
+}
+func cut(s string, n int) string { out := ""; for (i, c := range s) { if (i >= n) break; b := i8[]{c}; out += b -> string; } return out; }
+struct App {
+    rows string[]; refs string[]; selected int; width int; height int;
+    mode string; preview bool; detail string[]; scroll int; status string;
+    prompt string; input string; pending string; filter string; branch string;
+}
+func (a *App) load() {
+    branchLines := lines(git("symbolic-ref --short -q HEAD").text);
+    a.branch = len(branchLines) > 0 ? branchLines[0] : "detached HEAD";
+    a.rows = string[]{}; a.refs = string[]{};
+    if (a.mode == "files") {
+        a.rows = lines(git("status --short --untracked-files=all").text);
+        for (_, row := range a.rows) { b := ""; for (i,c := range row) { if (i >= 3) { x := i8[]{c}; b += x -> string; } } a.refs.append(b); }
+    } else if (a.mode == "branches") {
+        a.rows = lines(git("branch --format='%(refname:short)'").text); a.refs = a.rows;
+    } else if (a.mode == "operations") {
+        a.rows = lines(git("reflog --format='%h %gd %gs' -100").text);
+        for (i,_ := range a.rows) a.refs.append("HEAD@{" + io.Sprint(i) + "}");
+    } else {
+        args := "log --graph --all --date=relative --format='%H|%h  %an · %ar%d%n    %s' -150";
+        if (a.filter != "") args += " --grep=" + quote(a.filter);
+        last := "";
+        for (_, row := range lines(git(args).text)) {
+            marker := -1;
+            for (i,c := range row) { if (c == 124 && i >= 40) { marker = i; break; } }
+            if (marker >= 40) {
+                hash := ""; display := "";
+                for (i,c := range row) {
+                    byte := i8[]{c};
+                    if (i >= marker-40 && i < marker) hash += byte -> string;
+                    if (i < marker-40 || i > marker) display += byte -> string;
+                }
+                last = hash; a.rows.append(display); a.refs.append(hash);
+            } else { a.rows.append(row); a.refs.append(last); }
+        }
+    }
+    if (a.selected >= len(a.rows)) a.selected = len(a.rows) - 1;
+    if (a.selected < 0) a.selected = 0;
+    a.refresh();
+}
+func (a *App) ref() string { if (a.selected < len(a.refs)) { values := a.refs; index := a.selected; return values[index]; } return ""; }
+func (a *App) refresh() {
+    a.scroll = 0;
+    r := a.ref();
+    if (a.mode == "files") {
+        a.detail = lines(git("diff HEAD -- " + quote(r)).text);
+        if (len(a.detail) == 0) a.detail = lines(git("diff --no-index -- /dev/null " + quote(r)).text);
+    } else if (a.mode == "branches") a.detail = lines(git("log -10 --oneline " + quote(r)).text);
+    else if (r != "") a.detail = lines(git("show --stat --patch " + quote(r)).text);
+    else a.detail = lines(git("status").text);
+}
+func (a *App) Init() tui.Cmd { return tui.NoCmd; }
+func (a *App) Update(message tui.Msg) (tui.Model, tui.Cmd) {
+    switch (e := message.(type)) {
+    case tui.WindowSizeMsg: a.width = e.Width; a.height = e.Height;
+    case tui.EOFMsg: return a, tui.Quit;
+    case tui.KeyMsg:
+        k := e.Text;
+        if (e.Key == "ctrl+c") return a, tui.Quit;
+        if (a.prompt != "") {
+            if (e.Key == "esc") { a.prompt = ""; a.input = ""; }
+            else if (e.Key == "backspace") { a.input = cut(a.input, len(a.input)-1); }
+            else if (e.Key == "enter") {
+                if (a.prompt == "search") { a.filter = a.input; a.mode = "log"; }
+                else {
+                    cmd := a.pending;
+                    if (a.prompt != "confirm") cmd += quote(a.input);
+                    if (a.prompt != "confirm" || a.input == "yes") { result := git(cmd); a.status = result.text; }
+                }
+                a.prompt = ""; a.input = ""; a.load();
+            } else a.input += e.Text;
+            return a, tui.NoCmd;
+        }
+        if (k == "q") return a, tui.Quit;
+        if (k == "?" || e.Key == "f1") { a.mode = a.mode == "help" ? "log" : "help"; return a, tui.NoCmd; }
+        if (k == "j" || e.Key == "down") { if (a.selected+1 < len(a.rows)) a.selected++; a.refresh(); }
+        if (k == "k" || e.Key == "up") { if (a.selected > 0) a.selected--; a.refresh(); }
+        if (e.Key == "home" || k == "g") { a.selected = 0; a.refresh(); }
+        if (e.Key == "end" || k == "G") { a.selected = len(a.rows)-1; if (a.selected < 0) a.selected = 0; a.refresh(); }
+        if (e.Key == "ctrl+n" || e.Key == "ctrl+d") a.scroll += e.Key == "ctrl+d" ? 10 : 1;
+        if (e.Key == "ctrl+p" || e.Key == "ctrl+u") { a.scroll -= e.Key == "ctrl+u" ? 10 : 1; if (a.scroll < 0) a.scroll = 0; }
+        if (k == "p") a.preview = !a.preview;
+        if (k == "l" || e.Key == "right" || e.Key == "enter" || k == "d") { a.mode = "detail"; a.preview = true; }
+        if (k == "h" || e.Key == "left" || e.Key == "esc") { a.mode = "log"; a.load(); }
+        if (k == "f") { a.mode = "files"; a.selected = 0; a.load(); }
+        if (k == "b") { a.mode = "branches"; a.selected = 0; a.load(); }
+        if (k == "o") { a.mode = "operations"; a.selected = 0; a.load(); }
+        if (k == "R") a.load();
+        if (k == "/") { a.prompt = "search"; a.input = a.filter; }
+        if (k == "c") { a.prompt = "commit message"; a.pending = "commit -m "; }
+        if (k == "B") { a.prompt = "new branch"; a.pending = "branch "; }
+        if (k == "s" && a.mode == "files") { a.status = git("add -- " + quote(a.ref())).text; a.load(); }
+        if (k == "u" && a.mode == "files") { a.status = git("restore --staged -- " + quote(a.ref())).text; a.load(); }
+        if (k == "e" || k == "r" || k == "x" || k == "a") {
+            a.prompt = "confirm"; a.input = "";
+            if (k == "e") a.pending = "switch --detach " + quote(a.ref());
+            if (k == "e" && a.mode == "branches") a.pending = "switch " + quote(a.ref());
+            if (k == "r") a.pending = "rebase " + quote(a.ref());
+            if (k == "x") a.pending = "cherry-pick " + quote(a.ref());
+            if (k == "a") a.pending = "revert --no-edit " + quote(a.ref());
+        }
+    }
+    return a, tui.NoCmd;
+}
+func (a *App) View() string {
+    cyan := "\x1b[36m"; dim := "\x1b[90m"; reset := "\x1b[0m";
+    out := cyan + " gitui " + reset + " · " + a.branch + "  " + dim + "[" + a.mode + "]" + reset + "\n";
+    if (a.mode == "help") return out + "\n  NAVIGATION                       GIT OPERATIONS\n  j/k ↑/↓   select revision         f       working tree / staging\n  l / Enter revision details        s / u   stage / unstage file\n  h / Esc   revision log            c       commit staged changes\n  p         toggle preview          b / B   branches / create branch\n  Ctrl+n/p  scroll preview          e       checkout selected revision\n  Ctrl+d/u  scroll ten lines        r       rebase onto selected\n  /         search commit messages  x       cherry-pick selected\n  o         reflog                  a       revert selected\n  R         refresh                 q       quit\n\n  Mutations requiring confirmation display the exact Git command.\n  Type yes then Enter to execute; Escape cancels.\n\n  ? closes help";
+    available := a.height - 7; if (available < 2) available = 2;
+    count := a.preview ? available / 2 : available;
+    if (a.mode == "detail") count = 0;
+    start := a.selected - count + 1; if (start < 0) start = 0;
+    for (i := start; i < len(a.rows) && i < start+count; i++) {
+        prefix := "  ";
+        if (i == a.selected) out += "\x1b[7m› " + cut(a.rows[i], a.width-4) + reset + "\n";
+        else out += dim + prefix + reset + cut(a.rows[i], a.width-6) + "\n";
+    }
+    if (len(a.rows) == 0) out += dim + "  No entries · f working tree · c commit" + reset + "\n";
+    if (a.preview) {
+        out += cyan + "── preview ──────────────────────────────────────────────────────" + reset + "\n";
+        for (i := a.scroll; i < len(a.detail) && i < a.scroll+available-count-1; i++) {
+            line := a.detail[i]; color := reset;
+            if (len(line) > 0 && line[0] == 43) color = "\x1b[32m";
+            if (len(line) > 0 && line[0] == 45) color = "\x1b[31m";
+            out += color + cut(line,a.width-2) + reset + "\n";
+        }
+    }
+    out += "\n" + dim + " j/k move  l details  p preview  f files  b branches  o reflog  / search  ? help  q quit" + reset;
+    if (a.prompt != "") out += "\n" + cyan + (a.prompt == "confirm" ? a.pending + " · type yes: " : a.prompt + ": ") + reset + a.input + "▏";
+    else out += "\n" + cut(a.status, a.width-2);
+    return out;
+}
+func main() int {
+    args := os.Args();
+    for (_, arg := range args) { if (arg == "--help") { io.Println("gitui — jjui-inspired Git interface\nRun inside a Git repository. ocean run .\nUse ? for key bindings. --snapshot prints a noninteractive view."); return 0; } }
+    repo := git("rev-parse --show-toplevel");
+    if (repo.code != 0) { io.Println(repo.text); return 1; }
+    app := App{width: 100, height: 32, mode: "log", preview: true}; app.load();
+    for (_, arg := range args) { if (arg == "--snapshot") { io.Println(app.View()); return 0; } }
+    program := tui.NewProgram(&app, tui.Options{AltScreen: true}); program.Run().unwrap(); return 0;
+}
