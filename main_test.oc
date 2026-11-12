@@ -1,0 +1,22 @@
+package main;
+import "testing";
+import "term/tui";
+func TestUnicode(t *testing.T) {
+    if (cut("╭─○ hello",3) != "╭─○") t.Fatal("UTF-8 clipping broke a glyph");
+    if (graph("| *\\",false) != "│ ○╲") t.Fatal("graph conversion failed");
+    text := lines("│ ○ café\n");
+    if (text[0] != "│ ○ café") t.Fatal("UTF-8 log data was lost");
+}
+func TestRebaseDestination(t *testing.T) {
+    app := App{mode:"log", rows:string[]{"source","target"}, refs:string[]{"abc123","def456"}, branch:"feature"};
+    app.Update(tui.KeyMsg{Key:"rune",Text:"r"});
+    if (!app.rebase || app.source != "abc123") t.Fatal("source was not captured");
+    app.selected = 1;
+    app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.pending != "rebase --onto 'def456' 'abc123^' 'abc123'" || app.prompt != "confirm") t.Fatal("wrong rebase command",app.pending);
+}
+func TestRebaseCancel(t *testing.T) {
+    app := App{mode:"log",rebase:true,source:"abc"};
+    app.Update(tui.KeyMsg{Key:"esc"});
+    if (app.rebase || app.prompt != "") t.Fatal("cancel left an active operation");
+}
