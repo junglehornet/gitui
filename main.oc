@@ -4,7 +4,7 @@ import "io";
 import "os";
 extern *void popen(buffer<i8> command, buffer<i8> mode);
 extern i32 pclose(*void stream);
-extern i32 fgetc(*void stream);
+extern uint fread(buffer<i8> data, uint size, uint count, *void stream);
 
 func quote(s string) string {
     out := "'";
@@ -13,53 +13,69 @@ func quote(s string) string {
 }
 struct Reply { text string; code int; }
 func git(args string) Reply {
-    command := "git --no-pager -c color.ui=false " + args + " 2>&1\0";
+    command := "GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git --no-pager -c color.ui=false " + args + " </dev/null 2>&1\0";
     stream := extern.popen(command.data, "r\0".data);
     if (stream == null) return Reply{"Cannot start Git", 1};
-    bytes := i8[]{};
-    for (;;) { c := extern.fgetc(stream); if (c < 0) break; bytes.append(c -> i8); }
+    text := ""; chunk := i8[16384];
+    for (;;) {
+        count := extern.fread(chunk.data,1,16384,stream) -> int;
+        if (count == 0) break;
+        text += chunk[:count] -> string;
+    }
     code := extern.pclose(stream);
-    return Reply{bytes -> string, code};
+    return Reply{text, code < 0 ? 1 : (code & 127) != 0 ? 128 + (code & 127) : code >> 8};
 }
 func lines(s string) string[] {
-    result := string[]{}; current := "";
-    for (_, c := range s) { if (c == 10) { result.append(current); current = ""; } else if (c >= 32 || c < 0 || c == 9) { b := i8[]{c}; current += b -> string; } }
-    if (current != "") result.append(current);
+    result := string[]{}; start := 0;
+    for (i, c := range s) {
+        if (c == 10) { result.append(cleanLine(s[start:i])); start = i+1; }
+    }
+    if (start < len(s)) {
+        last := cleanLine(s[start:]);
+        if (last != "") result.append(last);
+    }
     return result;
+}
+func cleanLine(s string) string {
+    // Git output normally needs no filtering; avoid rebuilding those lines.
+    dirty := false;
+    for (_, c := range s) { if (c < 32 && c >= 0 && c != 9) dirty = true; }
+    if (!dirty) return s;
+    bytes := i8[len(s)]; data := bytes.data; count := 0;
+    for (_, c := range s) { if (c >= 32 || c < 0 || c == 9) { data[count] = c; count++; } }
+    return bytes[:count] -> string;
 }
 // Clip by UTF-8 scalars, preserving complete terminal glyphs and SGR sequences.
 func cut(s string, n int) string {
-    out := ""; cells := 0; escape := false;
-    for (_, c := range s) {
+    cells := 0; escape := false; end := 0;
+    for (i, c := range s) {
         byte := c -> u8;
         if (c == 27) escape = true;
         if (!escape && (byte < 128 || byte >= 192)) { if (cells >= n) break; cells++; }
-        b := i8[]{c}; out += b -> string;
+        end = i+1;
         if (escape && c == 109) escape = false;
     }
-    return out;
+    return s[:end];
 }
-func repeat(s string, n int) string { out := ""; for (i := 0; i < n; i++) out += s; return out; }
-func tail(s string, offset int) string { out := ""; for (i,c := range s) { if (i >= offset) { b := i8[]{c}; out += b -> string; } } return out; }
-func graph(s string, head bool) string {
-    out := "";
-    for (i,c := range s) {
-        if (c == 42) out += head ? "@" : "○";
-        else if (c == 124) out += "│";
-        else if (c == 47) out += "╱";
-        else if (c == 92) out += "╲";
-        else if (c == 45) out += "─";
-        else if (c == 95) out += "─";
-        else if (c == 46) out += "╮";
-        else { b := i8[]{c}; out += b -> string; }
+// Accumulate bytes in growable storage rather than copying a string per byte.
+func appendText(out *i8[], text string) {
+    for (_, c := range text) (*out).append(c);
+}
+func repeat(s string, n int) string {
+    out := ""; block := s;
+    for (n > 0) {
+        if (n % 2 != 0) out += block;
+        n /= 2;
+        if (n > 0) block += block;
     }
     return out;
 }
+func tail(s string, offset int) string { out := ""; for (i,c := range s) { if (i >= offset) { b := i8[]{c}; out += b -> string; } } return out; }
 struct App {
     rows string[]; refs string[]; selected int; width int; height int;
-    mode string; preview bool; detail string[]; scroll int; status string;
+    mode string; preview bool; detail string[]; detailVersion int; detailDirty bool; scroll int; status string;
     source string; rebase bool; rebaseKind string; head string;
-    prompt string; input string; pending string; filter string; branch string;
+    commandActions Action[]; commandHaystacks string[]; commandBackdrop string[]; commandSearch string; busy bool; fields string[]; field int; top int; previous string; prompt string; input string; pending string; filter string; branch string;
 }
 func (a *App) load() {
     branchLines := lines(git("symbolic-ref --short -q HEAD").text);
@@ -75,60 +91,68 @@ func (a *App) load() {
         a.rows = lines(git("reflog --format='%h %gd %gs' -100").text);
         for (i,_ := range a.rows) a.refs.append("HEAD@{" + io.Sprint(i) + "}");
     } else {
-        args := "log --graph --all --date=relative --format='%H|%h  %an · %ar%d%n    %s' -150";
-        if (a.filter != "") args += " --grep=" + quote(a.filter);
-        last := "";
-        for (_, row := range lines(git(args).text)) {
-            marker := -1;
-            for (i,c := range row) { if (c == 124 && i >= 40) { marker = i; break; } }
-            if (marker >= 40) {
-                hash := ""; display := "";
-                for (i,c := range row) {
-                    byte := i8[]{c};
-                    if (i >= marker-40 && i < marker) hash += byte -> string;
-                    if (i < marker-40 || i > marker) display += byte -> string;
-                }
-                prefix := ""; suffix := "";
-                for (i,c := range row) { b := i8[]{c}; if (i < marker-40) prefix += b -> string; if (i > marker) suffix += b -> string; }
-                last = hash; a.rows.append("\x1b[90m" + graph(prefix, hash == a.head) + "\x1b[0m\x1b[35m" + cut(suffix,7) + "\x1b[0m" + tail(suffix,7)); a.refs.append(hash);
-            } else { prefix := ""; rest := ""; inGraph := true;
-                for (_,c := range row) { if (c != 32 && c != 124 && c != 47 && c != 92 && c != 45 && c != 95 && c != 46) inGraph = false; b := i8[]{c}; if (inGraph) prefix += b -> string; else rest += b -> string; }
-                a.rows.append("\x1b[90m" + graph(prefix,false) + "\x1b[0m" + rest); a.refs.append(last); }
-        }
+        a.loadGraph();
     }
     if (a.selected >= len(a.rows)) a.selected = len(a.rows) - 1;
     if (a.selected < 0) a.selected = 0;
     a.refresh();
 }
 func (a *App) ref() string { if (a.selected < len(a.refs)) { values := a.refs; index := a.selected; return values[index]; } return ""; }
+struct DetailDone { version int; rows string[]; }
 func (a *App) refresh() {
-    a.scroll = 0;
-    r := a.ref();
-    if (a.mode == "files") {
-        a.detail = lines(git("diff HEAD -- " + quote(r)).text);
-        if (len(a.detail) == 0) a.detail = lines(git("diff --no-index -- /dev/null " + quote(r)).text);
-    } else if (a.mode == "branches") a.detail = lines(git("log -10 --oneline " + quote(r)).text);
-    else if (r != "") a.detail = lines(git("show --stat --patch " + quote(r)).text);
-    else a.detail = lines(git("status").text);
+    a.scroll = 0; a.detail = string[]{}; a.detailVersion++; a.detailDirty = true;
 }
-func (a *App) Init() tui.Cmd { return tui.NoCmd; }
+func (a *App) loadDetail() tui.Cmd {
+    if (!a.detailDirty || a.busy || (!a.preview && a.mode != "detail")) return tui.NoCmd;
+    if (a.mode != "log" && a.mode != "files" && a.mode != "branches" && a.mode != "operations" && a.mode != "detail") return tui.NoCmd;
+    a.detailDirty = false;
+    version := a.detailVersion; r := a.ref();
+    mode := a.mode == "detail" ? a.previous : a.mode;
+    return func() tui.Msg {
+        text := "";
+        if (mode == "files") {
+            text = git("diff HEAD -- " + quote(r)).text;
+            if (text == "") text = git("diff --no-index -- /dev/null " + quote(r)).text;
+        } else if (mode == "branches") text = git("log -10 --oneline " + quote(r)).text;
+        else if (r != "") text = git("show --stat --patch " + quote(r)).text;
+        else text = git("status").text;
+        return DetailDone{version,lines(text)};
+    };
+}
+func (a *App) Init() tui.Cmd { return a.loadDetail(); }
 func (a *App) Update(message tui.Msg) (tui.Model, tui.Cmd) {
     switch (e := message.(type)) {
+    case DetailDone:
+        if (e.version == a.detailVersion) a.detail = e.rows;
+    case CommandDone:
+        a.busy = false; a.mode = "log"; a.load(); a.previous = "log"; a.mode = "detail";
+        a.detail = lines("$ git " + e.command + "\n" + e.result.text + "\nExit status: " + io.Sprint(e.result.code));
+        a.detailDirty = false; a.scroll = 0; a.status = e.result.code == 0 ? "Command completed" : "Command failed · see output";
     case tui.WindowSizeMsg: a.width = e.Width; a.height = e.Height;
     case tui.EOFMsg: return a, tui.Quit;
     case tui.KeyMsg:
         k := e.Text;
+        if (a.busy) return a,tui.NoCmd;
         if (e.Key == "ctrl+c") return a, tui.Quit;
         if (a.prompt != "") {
-            if (e.Key == "esc") { a.prompt = ""; a.input = ""; }
-            else if (e.Key == "backspace") { a.input = cut(a.input, len(a.input)-1); }
+            if (e.Key == "esc") { a.prompt = ""; a.input = ""; a.fields = string[]{}; }
+            else if (e.Key == "backspace") { a.input = cut(a.input, width(a.input)-1); }
             else if (e.Key == "enter") {
                 if (a.prompt == "search") { a.filter = a.input; a.mode = "log"; }
-                else {
-                    cmd := a.pending;
-                    if (a.prompt != "confirm") cmd += quote(a.input);
-                    if (a.prompt != "confirm" || a.input == "yes") { result := git(cmd); a.status = result.text; }
-                }
+                else if (a.prompt == "Git arguments") {
+                    parsed := gitArguments(a.input);
+                    if (parsed.hasError()) { a.status = parsed.error(); return a,tui.NoCmd; }
+                    a.pending = parsed.unwrap(); a.prompt = "confirm"; a.input = ""; return a,tui.NoCmd;
+                } else if (a.prompt == "confirm") {
+                    if (a.input != "yes") { a.status = "Type yes to run, or Esc to cancel"; return a,tui.NoCmd; }
+                    return a,a.execute(a.pending);
+                } else if (len(a.fields) > 0) {
+                    if (a.input == "") { a.status = "A value is required"; return a,tui.NoCmd; }
+                    a.pending += " " + quote(a.input); a.input = ""; a.field++;
+                    index := a.field; a.prompt = index < len(a.fields) ? a.fields[index] : "confirm";
+                    if (a.field >= len(a.fields)) a.fields = string[]{};
+                    return a,tui.NoCmd;
+                } else { return a,a.execute(a.pending + quote(a.input)); }
                 a.prompt = ""; a.input = ""; a.load();
             } else a.input += e.Text;
             return a, tui.NoCmd;
@@ -147,16 +171,30 @@ func (a *App) Update(message tui.Msg) (tui.Model, tui.Cmd) {
             }
             if (k != "j" && k != "k" && e.Key != "up" && e.Key != "down" && e.Key != "home" && e.Key != "end") return a,tui.NoCmd;
         }
-        if (k == "q") return a, tui.Quit;
-        if (k == "?" || e.Key == "f1") { a.mode = a.mode == "help" ? "log" : "help"; return a, tui.NoCmd; }
-        if (k == "j" || e.Key == "down") { if (a.selected+1 < len(a.rows)) a.selected++; a.refresh(); }
-        if (k == "k" || e.Key == "up") { if (a.selected > 0) a.selected--; a.refresh(); }
-        if (e.Key == "home" || k == "g") { a.selected = 0; a.refresh(); }
+        if (a.mode == "commands") {
+            if (e.Key == "down" || e.Key == "ctrl+n") { if (a.selected+1 < len(a.rows)) a.selected++; }
+            else if (e.Key == "up" || e.Key == "ctrl+p") { if (a.selected > 0) a.selected--; }
+            else if (e.Key == "enter") a.startCommand();
+            else if (e.Key == "esc") { a.mode = "log"; a.selected = 0; a.load(); }
+            else if (e.Key == "backspace") { a.commandSearch = cut(a.commandSearch,width(a.commandSearch)-1); a.filterCommands(); }
+            else if (e.Key == "ctrl+u") { a.commandSearch = ""; a.filterCommands(); }
+            else if (e.Text != "") { a.commandSearch += e.Text; a.filterCommands(); }
+            return a,tui.NoCmd;
+        }
+        if (k == ":") { a.prompt = "Git arguments"; a.input = ""; return a,tui.NoCmd; }
+        if (k == "g") { a.openCommands(); return a,tui.NoCmd; }
+        if (k == "q") { if (a.mode == "detail" || a.mode == "help") { a.mode = a.previous == "" ? "log" : a.previous; return a,tui.NoCmd; } return a, tui.Quit; }
+        if (k == "?" || e.Key == "f1") { if (a.mode == "help") a.mode = a.previous; else { a.previous = a.mode; a.mode = "help"; } return a, tui.NoCmd; }
+        if (k == "j" || e.Key == "down") { a.move(1); }
+        if (k == "k" || e.Key == "up") { a.move(-1); }
+        if (e.Key == "home") { a.selected = 0; a.refresh(); }
         if (e.Key == "end" || k == "G") { a.selected = len(a.rows)-1; if (a.selected < 0) a.selected = 0; a.refresh(); }
-        if (e.Key == "ctrl+n" || e.Key == "ctrl+d") a.scroll += e.Key == "ctrl+d" ? 10 : 1;
-        if (e.Key == "ctrl+p" || e.Key == "ctrl+u") { a.scroll -= e.Key == "ctrl+u" ? 10 : 1; if (a.scroll < 0) a.scroll = 0; }
+        if (e.Key == "ctrl+n" || e.Key == "ctrl+d") a.scroll += e.Key == "ctrl+d" ? a.height / 2 : 1;
+        if (e.Key == "ctrl+p" || e.Key == "ctrl+u") { a.scroll -= e.Key == "ctrl+u" ? a.height / 2 : 1; if (a.scroll < 0) a.scroll = 0; }
+        if (a.scroll >= len(a.detail)) a.scroll = len(a.detail) > 0 ? len(a.detail)-1 : 0;
+        if (e.Key == "pgdown" || e.Key == "pgup") { for (i := 0; i < a.height / 4; i++) a.move(e.Key == "pgdown" ? 1 : -1); }
         if (k == "p") a.preview = !a.preview;
-        if (k == "l" || e.Key == "right" || e.Key == "enter" || k == "d") { a.mode = "detail"; a.preview = true; }
+        if ((k == "l" || e.Key == "right" || e.Key == "enter" || k == "d") && a.mode != "detail") { a.previous = a.mode; a.mode = "detail"; a.scroll = 0; }
         if (k == "h" || e.Key == "left" || e.Key == "esc") { a.mode = "log"; a.load(); }
         if (k == "f") { a.mode = "files"; a.selected = 0; a.load(); }
         if (k == "b") { a.mode = "branches"; a.selected = 0; a.load(); }
@@ -181,36 +219,7 @@ func (a *App) Update(message tui.Msg) (tui.Model, tui.Cmd) {
             if (k == "a") a.pending = "revert --no-edit " + quote(a.ref());
         }
     }
-    return a, tui.NoCmd;
-}
-func (a *App) View() string {
-    cyan := "\x1b[36m"; dim := "\x1b[90m"; reset := "\x1b[0m";
-    out := dim + "Revset: " + reset + (a.filter == "" ? "all()" : a.filter) + "\n" + dim + repeat("─", a.width-1) + reset + "\n";
-    if (a.mode == "help") return out + "\n  NAVIGATION                       GIT OPERATIONS\n  j/k ↑/↓   select revision         f       working tree / staging\n  l / Enter revision details        s / u   stage / unstage file\n  h / Esc   revision log            c       commit staged changes\n  p         toggle preview          b / B   branches / create branch\n  Ctrl+n/p  scroll preview          e       checkout selected revision\n  Ctrl+d/u  scroll ten lines        r       select rebase destination\n  /         search commit messages  x       cherry-pick selected\n  o         reflog                  a       revert selected\n  R         refresh                 q       quit\n\n  Mutations requiring confirmation display the exact Git command.\n  Type yes then Enter to execute; Escape cancels.\n\n  C / A     continue / abort rebase\n  ? closes help";
-    available := a.height - 7; if (available < 2) available = 2;
-    count := a.preview ? available / 2 : available;
-    if (a.mode == "detail") count = 0;
-    start := a.selected - count + 1; if (start < 0) start = 0;
-    for (i := start; i < len(a.rows) && i < start+count; i++) {
-        prefix := "  ";
-        if (i == a.selected) out += "\x1b[48;5;237m" + "  " + cut(a.rows[i], a.width-4) + reset + "\n";
-        else out += dim + prefix + reset + cut(a.rows[i], a.width-6) + "\n";
-    }
-    if (len(a.rows) == 0) out += dim + "  No entries · f working tree · c commit" + reset + "\n";
-    if (a.preview) {
-        out += dim + "─ Preview " + repeat("─", a.width-11) + reset + "\n";
-        for (i := a.scroll; i < len(a.detail) && i < a.scroll+available-count-1; i++) {
-            line := a.detail[i]; color := reset;
-            if (len(line) > 0 && line[0] == 43) color = "\x1b[32m";
-            if (len(line) > 0 && line[0] == 45) color = "\x1b[31m";
-            out += color + cut(line,a.width-2) + reset + "\n";
-        }
-    }
-    out += "\n" + dim + repeat("─",a.width-1) + reset + "\n" + cyan + " " + a.branch + " " + reset + "  " + dim + " j/k move  l details  p preview  f files  b branches  o reflog  / search  ? help  q quit" + reset;
-    if (a.rebase) out += "\n\x1b[33mRebase " + cut(a.source,8) + " onto " + cut(a.ref(),8) + " · " + a.rebaseKind + " [s revision / b current branch] · Enter confirm · Esc cancel\x1b[0m";
-    else if (a.prompt != "") out += "\n" + cyan + (a.prompt == "confirm" ? a.pending + " · type yes: " : a.prompt + ": ") + reset + a.input + "▏";
-    else out += "\n" + cut(a.status, a.width-2);
-    return out;
+    return a, a.loadDetail();
 }
 func main() int {
     args := os.Args();

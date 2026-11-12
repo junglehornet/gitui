@@ -1,0 +1,32 @@
+package main;
+import "testing";
+func fixture(id string, parents string[]) Revision {
+    return Revision{id,parents,id,"author@example.com","now","",id + " description"};
+}
+func TestGraphMergeAndJoin(t *testing.T) {
+    app := App{head:"merge"};
+    app.renderGraph(Revision[]{fixture("merge",string[]{"left","right"}),fixture("right",string[]{"base"}),fixture("left",string[]{"base"}),fixture("base",string[]{})});
+    if (plainText(app.rows[0]) != "@    author@example.com now git_head() merge") t.Fatal("incorrect merge node spacing",plainText(app.rows[0]));
+    if (plainText(app.rows[1]) != "├─╮  merge description") t.Fatal("merge junction incorrect",app.rows[1]);
+    if (plainText(app.rows[5]) != "├─╯  left description") t.Fatal("join junction incorrect",app.rows[5]);
+    if (len(app.rows) != 8 || len(app.refs) != 8) t.Fatal("wrong revision grouping");
+    for (i := 0; i < 8; i += 2) { if (app.refs[i] != app.refs[i+1]) t.Fatal("description selected independently"); }
+}
+func TestGraphOctopus(t *testing.T) {
+    app := App{};
+    app.renderGraph(Revision[]{fixture("merge",string[]{"a","b","c","d"})});
+    if (app.rows[1] != "├─┬─┬─╮  merge description") t.Fatal("octopus junction incorrect",app.rows[1]);
+    if (app.rows[2] != "~ ~ ~ ~ ") t.Fatal("truncated parents not marked");
+}
+func TestGraphLinearAndRoot(t *testing.T) {
+    app := App{head:"tip"};
+    app.renderGraph(Revision[]{fixture("tip",string[]{"root"}),fixture("root",string[]{})});
+    if (app.rows[1] != "│  tip description") t.Fatal("linear edge wrong");
+    if (app.rows[3] != "   root description") t.Fatal("root must terminate");
+    if (!containsText(app.rows[0],"\x1b[1;34mtip")) t.Fatal("commit id must be bold blue");
+}
+func TestGraphSubjectPreserved(t *testing.T) {
+    app := App{}; revision := fixture("id",string[]{}); revision.subject = "| -- café / text";
+    app.renderGraph(Revision[]{revision});
+    if (app.rows[1] != "   | -- café / text") t.Fatal("description treated as graph edges");
+}

@@ -1,0 +1,23 @@
+package main;
+import "testing";
+func TestUpstreamDarkPalette(t *testing.T) {
+    if (style("git title") != "\x1b[1;38;5;230;48;5;62m") t.Fatal("Git title differs from upstream dark palette");
+    if (style("help title") != "\x1b[1;32m") t.Fatal("help title differs");
+    if (style("git selected") != "\x1b[1;36m") t.Fatal("Git selection differs");
+    if (style("confirmation") != "\x1b[1;35m") t.Fatal("confirmation differs");
+}
+func TestShortcutFormatting(t *testing.T) {
+    rendered := shortcuts(string[]{"j/k move","p preview"},80);
+    if (plainText(rendered) != "j/k move • p preview") t.Fatal("wrong shortcut separators");
+    if (!containsText(rendered,"\x1b[35mj/k\x1b[0m")) t.Fatal("shortcut not magenta");
+    compact := shortcuts(string[]{"j/k move","p preview","q quit"},18);
+    if (plainText(compact) != "j/k move • ? more") t.Fatal("truncated a shortcut instead of showing more");
+}
+func TestMenuFormatting(t *testing.T) {
+    app := App{width:100,height:32}; app.openCommands();
+    app.commandSearch = "push"; app.filterCommands();
+    rendered := app.View();
+    if (containsText(plainText(rendered),"›")) t.Fatal("menu has non-upstream arrow marker");
+    if (!containsText(rendered,painted("git title","Git Operations"))) t.Fatal("menu title missing theme");
+    if (!containsText(menuLabel("Push current branch","push",true),"\x1b[1;35mPush")) t.Fatal("search match not highlighted");
+}

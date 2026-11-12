@@ -3,7 +3,6 @@ import "testing";
 import "term/tui";
 func TestUnicode(t *testing.T) {
     if (cut("╭─○ hello",3) != "╭─○") t.Fatal("UTF-8 clipping broke a glyph");
-    if (graph("| *\\",false) != "│ ○╲") t.Fatal("graph conversion failed");
     text := lines("│ ○ café\n");
     if (text[0] != "│ ○ café") t.Fatal("UTF-8 log data was lost");
 }
@@ -19,4 +18,60 @@ func TestRebaseCancel(t *testing.T) {
     app := App{mode:"log",rebase:true,source:"abc"};
     app.Update(tui.KeyMsg{Key:"esc"});
     if (app.rebase || app.prompt != "") t.Fatal("cancel left an active operation");
+}
+func TestFrameDimensions(t *testing.T) {
+    for (_, size := range int[]{1, 12, 40, 100}) {
+        app := App{width:size,height:12,mode:"log",rows:string[]{"○ abc", "│ description"},refs:string[]{"abc","abc"}};
+        for (_, mode := range string[]{"log","help","detail","files"}) {
+            app.mode = mode;
+            for (_, preview := range bool[]{false,true}) {
+                app.preview = preview;
+                rendered := string[]{}; current := "";
+                for (_, c := range app.View()) { if (c == 10) { rendered.append(current); current = ""; } else { byte := i8[]{c}; current += byte -> string; } }
+                rendered.append(current);
+                if (len(rendered) != 12) t.Fatal("frame height changed",size,mode,len(rendered));
+                for (_, row := range rendered) { if (width(row) >= size && size > 1) t.Fatal("frame overflows",size,width(row)); }
+            }
+        }
+    }
+}
+func TestRevisionSelection(t *testing.T) {
+    app := App{mode:"log",rows:string[]{"○ a","│ first","○ b","│ second"},refs:string[]{"a","a","b","b"}};
+    // Boundary movement must retain the first revision without invoking Git.
+    app.move(-1);
+    if (app.selected != 0) t.Fatal("moved before first revision");
+    app.selected = 2;
+    app.move(1);
+    if (app.selected != 2) t.Fatal("selected a description instead of a revision");
+    app.mode = "detail"; app.detail = string[]{"one","two"};
+    app.move(1); app.move(1);
+    if (app.scroll != 1 || app.selected != 2) t.Fatal("diff navigation changed revision");
+}
+func TestHighlightReset(t *testing.T) {
+    value := highlight("\x1b[35mabc\x1b[0m description");
+    if (value != "\x1b[100m\x1b[35mabc\x1b[0m\x1b[100m description\x1b[0m") t.Fatal("selection background lost at styled field");
+}
+func TestNavigationDefersHiddenDetails(t *testing.T) {
+    app := App{mode:"log", rows:string[]{"a","description","b","description"},refs:string[]{"a","a","b","b"}};
+    _, command := app.Update(tui.KeyMsg{Key:"down"});
+    if (app.selected != 2 || !app.detailDirty || command != tui.NoCmd) t.Fatal("hidden navigation loaded a patch");
+    _, command = app.Update(tui.KeyMsg{Key:"rune",Text:"p"});
+    if (!app.preview || app.detailDirty || command == tui.NoCmd) t.Fatal("enabling preview did not request details");
+    old := app.detailVersion;
+    app.Update(tui.KeyMsg{Key:"up"});
+    app.Update(DetailDone{old,string[]{"stale patch"}});
+    if (len(app.detail) != 0) t.Fatal("old selection's patch replaced current details");
+    app.Update(DetailDone{app.detailVersion,string[]{"current patch"}});
+    if (len(app.detail) != 1 || app.detail[0] != "current patch") t.Fatal("current patch was discarded");
+}
+func TestOpenDetailsRequestsPatch(t *testing.T) {
+    app := App{mode:"log", rows:string[]{"a"},refs:string[]{"a"}}; app.refresh();
+    _, command := app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.mode != "detail" || command == tui.NoCmd) t.Fatal("opening details did not request a patch");
+}
+func TestGitOutputAcrossChunks(t *testing.T) {
+    reply := git("log -1 --format=tformat:" + quote(repeat("x",20000)));
+    if (reply.code != 0 || len(reply.text) != 20001 || reply.text != repeat("x",20000)+"\n") t.Fatal("chunked Git reader lost output",reply.code,len(reply.text),cut(reply.text,80));
+    parsed := lines("a\r\n\n\x01b\tcafé\n");
+    if (len(parsed) != 3 || parsed[0] != "a" || parsed[1] != "" || parsed[2] != "b\tcafé") t.Fatal("line parsing changed control or UTF-8 handling");
 }

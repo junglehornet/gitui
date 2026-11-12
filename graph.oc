@@ -1,0 +1,104 @@
+package main;
+
+struct Revision { id string; parents string[]; short string; author string; date string; labels string; subject string; }
+func splitText(s string, separator i8) string[] {
+    out := string[]{}; value := "";
+    for (_, c := range s) {
+        if (c == separator) { out.append(value); value = ""; }
+        else { byte := i8[]{c}; value += byte -> string; }
+    }
+    out.append(value); return out;
+}
+func laneIndex(lanes string[], id string) int {
+    for (i, value := range lanes) { if (value == id) return i; }
+    return -1;
+}
+// Connections: up=1, down=2, left=4, right=8.
+func junction(mask int) string {
+    switch (mask) {
+    case 0: return " ";
+    case 1: return "│";
+    case 2: return "│";
+    case 3: return "│";
+    case 4: return "─";
+    case 8: return "─";
+    case 12: return "─";
+    case 9: return "╰";
+    case 5: return "╯";
+    case 10: return "╭";
+    case 6: return "╮";
+    case 11: return "├";
+    case 7: return "┤";
+    case 13: return "┴";
+    case 14: return "┬";
+    case 15: return "┼";
+    }
+    return " ";
+}
+func connect(cells *int[], from int, to int) {
+    start := from*2; end := to*2;
+    (*cells)[start] |= 1; (*cells)[end] |= 2;
+    if (start < end) {
+        for (i := start; i < end; i++) { (*cells)[i] |= 8; (*cells)[i+1] |= 4; }
+    } else {
+        for (i := end; i < start; i++) { (*cells)[i] |= 8; (*cells)[i+1] |= 4; }
+    }
+}
+func (a *App) renderGraph(revisions Revision[]) {
+    a.rows = string[]{}; a.refs = string[]{}; lanes := string[]{};
+    for (_, revision := range revisions) {
+        column := laneIndex(lanes,revision.id);
+        if (column < 0) { lanes.append(revision.id); column = len(lanes)-1; }
+        parents := string[]{};
+        for (_, parent := range revision.parents) {
+            if (parent != "" && laneIndex(parents,parent) < 0) parents.append(parent);
+        }
+        next := string[]{};
+        for (i, id := range lanes) {
+            if (i != column) next.append(id);
+            else for (_, parent := range parents) {
+                if (laneIndex(lanes,parent) < 0) next.append(parent);
+            }
+        }
+        span := len(lanes) > len(next) ? len(lanes) : len(next);
+        prefix := "";
+        for (i := 0; i < span; i++) {
+            symbol := i < len(lanes) ? "│" : " ";
+            if (i == column) symbol = revision.id == a.head ? "\x1b[1;32m@\x1b[0m" : "○";
+            prefix += symbol + " ";
+        }
+        labels := revision.labels;
+
+        // Git has commit IDs, not Jujutsu change IDs: retain the real identifier.
+        meta := "\x1b[33m" + revision.author + "\x1b[0m \x1b[36m" + revision.date + "\x1b[0m ";
+        if (revision.id == a.head) meta += "\x1b[32mgit_head()\x1b[0m ";
+        if (labels != "") meta += "\x1b[35m" + labels + "\x1b[0m ";
+        meta += "\x1b[1;34m" + revision.short + "\x1b[0m";
+        a.rows.append(prefix + " " + meta); a.refs.append(revision.id);
+        cells := int[]{}; for (i := 0; i < span*2-1; i++) cells.append(0);
+        for (i, id := range lanes) {
+            if (i == column) { for (_, parent := range parents) connect(&cells,i,laneIndex(next,parent)); }
+            else connect(&cells,i,laneIndex(next,id));
+        }
+        edges := ""; for (_, mask := range cells) edges += junction(mask);
+        a.rows.append(edges + "  " + (revision.subject == "" ? "\x1b[33m(no description set)\x1b[0m" : revision.subject));
+        a.refs.append(revision.id); lanes = next;
+    }
+    // Show that history continues when the log limit or filter hides parents.
+    if (len(lanes) > 0 && len(revisions) > 0) {
+        a.rows.append(repeat("~ ",len(lanes))); last := len(revisions)-1; a.refs.append(revisions[last].id);
+    }
+}
+func (a *App) loadGraph() {
+    args := "log --topo-order --all HEAD --date=relative --format='%H%x1f%P%x1f%h%x1f%ae%x1f%ar%x1f%D%x1f%s' -150";
+    if (a.filter != "") args += " --grep=" + quote(a.filter);
+    result := git(args);
+    if (result.code != 0) { a.rows = string[]{}; a.refs = string[]{}; return; }
+    revisions := Revision[]{};
+    for (_, line := range splitText(result.text,10)) {
+        fields := splitText(line,31);
+        if (len(fields) != 7) continue;
+        revisions.append(Revision{fields[0],splitText(fields[1],32),fields[2],fields[3],fields[4],fields[5],fields[6]});
+    }
+    a.renderGraph(revisions);
+}

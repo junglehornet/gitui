@@ -1,0 +1,121 @@
+package main;
+import "term/tui";
+import "io";
+
+struct Action { name string; command string; fields string[]; }
+struct CommandDone { command string; result Reply; }
+func actions() Action[] {
+    return Action[]{
+        {"Fetch all remotes", "fetch --all --prune", string[]{}},
+        {"Push current branch", "push", string[]{}},
+        {"Push and set upstream", "push --set-upstream", string[]{"remote", "branch"}},
+        {"Pull (fast-forward only)", "pull --ff-only", string[]{}},
+        {"Pull with rebase", "pull --rebase", string[]{}},
+        {"Force push with lease", "push --force-with-lease", string[]{"remote", "branch"}},
+        {"List remotes", "remote -v", string[]{}},
+        {"Add remote", "remote add", string[]{"remote name", "remote URL"}},
+        {"Change remote URL", "remote set-url", string[]{"remote name", "remote URL"}},
+        {"Rename remote", "remote rename", string[]{"old remote name", "new remote name"}},
+        {"Remove remote", "remote remove", string[]{"remote name"}},
+        {"Inspect remote", "remote show", string[]{"remote name"}},
+        {"Delete remote branch", "push --delete", string[]{"remote", "branch"}},
+        {"Switch branch", "switch", string[]{"branch"}},
+        {"Create and switch branch", "switch -c", string[]{"new branch", "start revision"}},
+        {"Rename branch", "branch -m", string[]{"old branch", "new branch"}},
+        {"Delete merged branch", "branch -d", string[]{"branch"}},
+        {"Merge branch", "merge --no-edit", string[]{"branch"}},
+        {"Abort merge", "merge --abort", string[]{}},
+        {"Stage all changes", "add --all", string[]{}},
+        {"Unstage all changes", "restore --staged -- .", string[]{}},
+        {"Commit staged changes", "commit -m", string[]{"commit message"}},
+        {"Amend commit message", "commit --amend -m", string[]{"commit message"}},
+        {"Stash including untracked files", "stash push --include-untracked -m", string[]{"stash message"}},
+        {"List stashes", "stash list", string[]{}},
+        {"Apply stash", "stash apply", string[]{"stash reference (stash@{0})"}},
+        {"Pop stash", "stash pop", string[]{"stash reference (stash@{0})"}},
+        {"Drop stash", "stash drop", string[]{"stash reference (stash@{0})"}},
+        {"List tags", "tag --list", string[]{}},
+        {"Create tag", "tag", string[]{"tag name", "revision"}},
+        {"Delete tag", "tag -d", string[]{"tag name"}},
+        {"Push tags", "push --tags", string[]{"remote"}},
+        {"Continue rebase", "-c core.editor=true rebase --continue", string[]{}},
+        {"Skip rebase commit", "rebase --skip", string[]{}},
+        {"Abort rebase", "rebase --abort", string[]{}},
+        {"Continue cherry-pick", "-c core.editor=true cherry-pick --continue", string[]{}},
+        {"Abort cherry-pick", "cherry-pick --abort", string[]{}},
+        {"Continue revert", "-c core.editor=true revert --continue", string[]{}},
+        {"Abort revert", "revert --abort", string[]{}},
+        {"Resolve file using ours", "checkout --ours --", string[]{"file path"}},
+        {"Resolve file using theirs", "checkout --theirs --", string[]{"file path"}},
+        {"Mark file resolved / stage file", "add --", string[]{"file path"}},
+        {"Discard unstaged file changes", "restore --worktree --", string[]{"file path"}},
+        {"Reset keeping changes staged", "reset --soft", string[]{"revision"}},
+        {"Reset keeping working files", "reset --mixed", string[]{"revision"}},
+        {"Reset and discard tracked changes", "reset --hard", string[]{"revision"}},
+        {"List worktrees", "worktree list", string[]{}},
+        {"Add worktree", "worktree add", string[]{"directory", "branch"}},
+        {"Remove worktree", "worktree remove", string[]{"directory"}},
+        {"Update submodules", "submodule update --init --recursive", string[]{}},
+        {"Repository configuration", "config --local --list", string[]{}},
+        {"Set repository configuration", "config --local", string[]{"key", "value"}},
+        {"Status", "status", string[]{}},
+        {"Conflicted files", "diff --name-only --diff-filter=U", string[]{}},
+        {"Staged diff", "diff --cached", string[]{}}
+    };
+}
+// Parse argument words, never shell syntax. All resulting words are shell-quoted.
+func gitArguments(text string) Result<string> {
+    out := ""; word := ""; quoted: i8 = 0; escaped := false; active := false;
+    for (_, c := range text) {
+        if (escaped) { byte := i8[]{c}; word += byte -> string; escaped = false; active = true; }
+        else if (c == 92 && quoted != 39) { escaped = true; active = true; }
+        else if (quoted != 0) { if (c == quoted) quoted = 0; else { byte := i8[]{c}; word += byte -> string; } }
+        else if (c == 39 || c == 34) { quoted = c; active = true; }
+        else if (c == 32 || c == 9) { if (active) { out += quote(word) + " "; word = ""; active = false; } }
+        else { byte := i8[]{c}; word += byte -> string; active = true; }
+    }
+    if (quoted != 0 || escaped) return Result<string>.error("Unclosed quote or trailing backslash");
+    if (active) out += quote(word);
+    if (out == "") return Result<string>.error("Enter Git arguments");
+    return Result<string>.value(out);
+}
+func (a *App) openCommands() {
+    a.commandBackdrop = lines(plainText(a.View()));
+    a.mode = "commands"; a.commandSearch = ""; a.status = ""; a.filterCommands();
+}
+func lowerAscii(s string) string {
+    out := i8[]{};
+    for (_, c := range s) { value := c; if (c >= 65 && c <= 90) value += 32; out.append(value); }
+    return out -> string;
+}
+func containsText(s string, query string) bool {
+    for (i := 0; i+len(query) <= len(s); i++) {
+        j := 0; for (j < len(query) && s[i+j] == query[j]) j++;
+        if (j == len(query)) return true;
+    }
+    return false;
+}
+func (a *App) filterCommands() {
+    if (len(a.commandActions) == 0) {
+        a.commandActions = actions();
+        for (_, action := range a.commandActions) a.commandHaystacks.append(lowerAscii(action.name + " " + action.command));
+    }
+    a.rows = string[]{}; a.refs = string[]{};
+    query := lowerAscii(a.commandSearch);
+    for (i, action := range a.commandActions) {
+        if (containsText(a.commandHaystacks[i],query)) {
+            a.rows.append(action.name); a.refs.append(io.Sprint(i));
+        }
+    }
+    a.selected = 0; a.top = 0;
+}
+func (a *App) startCommand() {
+    if (len(a.refs) == 0) return;
+    index := io.ParseInt(a.ref()).unwrap(); action := a.commandActions[index];
+    a.pending = action.command; a.fields = action.fields; a.field = 0; a.input = "";
+    a.prompt = len(a.fields) > 0 ? a.fields[0] : "confirm";
+}
+func (a *App) execute(command string) tui.Cmd {
+    a.busy = true; a.status = "Running git " + command; a.prompt = ""; a.input = "";
+    return func() tui.Msg { return CommandDone{command,git(command)}; };
+}

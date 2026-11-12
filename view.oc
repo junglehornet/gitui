@@ -1,0 +1,194 @@
+package main;
+import "io";
+
+func width(s string) int {
+    result := 0; escape := false;
+    for (_, c := range s) {
+        b := c -> u8;
+        if (c == 27) escape = true;
+        else if (escape) { if (c == 109) escape = false; }
+        else if (b < 128 || b >= 192) result++;
+    }
+    return result;
+}
+func fit(s string, size int) string {
+    text := cut(s, size);
+    return text + repeat(" ", size - width(text));
+}
+func highlight(s string) string {
+    out := ""; i := 0;
+    for (i < len(s)) {
+        if (i+3 < len(s) && s[i] == 27 && s[i+1] == 91 && s[i+2] == 48 && s[i+3] == 109) {
+            out += "\x1b[0m\x1b[100m"; i += 4;
+        } else { out += s[i:i+1]; i++; }
+    }
+    return "\x1b[100m" + out + "\x1b[0m";
+}
+func (a *App) move(direction int) {
+    if (a.mode == "detail") {
+        a.scroll += direction;
+        if (a.scroll < 0) a.scroll = 0;
+        if (a.scroll >= len(a.detail)) a.scroll = len(a.detail) > 0 ? len(a.detail)-1 : 0;
+        return;
+    }
+    old := a.ref(); next := a.selected + direction;
+    for (next >= 0 && next < len(a.refs)) {
+        if (a.refs[next] != old) {
+            for (next > 0 && a.refs[next-1] == a.refs[next]) next--;
+            a.selected = next; a.refresh(); return;
+        }
+        next += direction;
+    }
+}
+func diffLine(line string) string {
+    color := "\x1b[0m";
+    if (len(line) > 0) {
+        if (line[0] == 43) color = "\x1b[32m";
+        if (line[0] == 45) color = "\x1b[31m";
+        if (line[0] == 64) color = "\x1b[36m";
+        if (len(line) >= 5 && line[:5] == "diff ") color = "\x1b[1;33m";
+    }
+    return color + line;
+}
+func (a *App) View() string {
+    if (a.mode == "commands") return a.commandView();
+    w := a.width-1; if (w < 1) w = 1;
+    h := a.height; if (h < 1) h = 1;
+    dim := "\x1b[90m"; reset := "\x1b[0m"; cyan := "\x1b[36m";
+    body := h-2; if (body < 0) body = 0;
+    frame := string[]{};
+    title := "\x1b[35mrevset: " + reset + "\x1b[1;32m" + (a.filter == "" ? "all()" : "message: " + a.filter);
+    if (a.mode == "files") title = "Working copy";
+    if (a.mode == "branches") title = "Bookmarks / Git branches";
+    if (a.mode == "operations") title = "Operation log / Git reflog";
+    if (a.mode == "detail") title = "Diff · " + cut(a.ref(),12);
+    if (a.mode == "help") title = painted("help title","Help");
+    if (a.mode == "commands") title = "\x1b[1;36mGit · select an operation";
+    frame.append(dim + fit(title,w) + reset);
+    side := a.preview && a.mode != "detail" && a.mode != "help" && a.height < a.width / 2;
+    rowWidth := w; if (side) rowWidth = (w-1) / 2;
+    count := body;
+    if (a.preview && a.mode != "detail" && !side) count = body / 2;
+    if (a.mode == "detail") count = 0;
+    help := string[]{"Navigation", "  j/k  ↑/↓    select revision     Home/End  first/last", "  l / Enter   revision diff      h / Esc   return to log", "  p           toggle preview     d         full diff", "  Ctrl+n/p    scroll preview     Ctrl+d/u  half page", "  /           search messages    R         refresh", "", "Views", "  f           working copy       b / B     branches / create", "  o           reflog             ?         help", "", "Git operations", "  g           operation menu     :         Git arguments", "  s / u       stage / unstage file", "  c           commit index       e         checkout", "  r           rebase             x         cherry-pick", "  a           revert             C / A     continue / abort rebase", "", "  Rebase: j/k destination, s revision, b branch, Enter confirm", "  Confirmations show the Git command; type yes to execute.", "  Esc cancels a prompt. q closes help/diff or quits."};
+    if (a.mode == "help") {
+        for (i := 0; i < body; i++) {
+            text := i < len(help) ? help[i] : "";
+            if (text == "Navigation" || text == "Views" || text == "Git operations") text = painted("help title",text);
+            else if (len(text) > 2 && text[:2] == "  ") {
+                end := 2; for (end < len(text) && text[end] != 32) end++;
+                text = "  " + painted("shortcut",text[2:end]) + text[end:];
+            }
+            frame.append(text);
+        }
+    } else {
+        if (a.selected < a.top) a.top = a.selected;
+        end := a.selected;
+        for (end+1 < len(a.refs) && a.refs[end+1] == a.ref()) end++;
+        if (end >= a.top+count) a.top = end-count+1;
+        if (a.top > a.selected) a.top = a.selected;
+        if (a.top < 0) a.top = 0;
+        for (i := 0; i < count; i++) {
+            index := a.top+i; row := "";
+            if (index < len(a.rows)) {
+                row = fit(a.rows[index],rowWidth);
+                if (a.refs[index] == a.ref()) row = highlight(row);
+            } else if (i == 0 && len(a.rows) == 0) row = dim + " No entries";
+            if (side) {
+                row = fit(row,rowWidth) + reset + dim + "│" + reset;
+                index = a.scroll+i;
+                if (index < len(a.detail)) row += cut(diffLine(a.detail[index]),w-rowWidth-1);
+            }
+            frame.append(row + reset);
+        }
+        if ((a.preview && !side) || a.mode == "detail") {
+            remaining := body-count;
+            if (remaining > 0 && a.mode != "detail") {
+                frame.append(dim + fit("─ Preview " + cut(a.ref(),12) + " " + repeat("─",w),w) + reset); remaining--;
+            }
+            for (i := 0; i < remaining; i++) {
+                index := a.scroll+i;
+                frame.append(index < len(a.detail) ? diffLine(a.detail[index]) + reset : "");
+            }
+        }
+    }
+
+    status := "\x1b[1;30;45m " + a.mode + " \x1b[0m " + cyan + a.branch + reset + dim + "  " + a.mode + "  " + io.Sprint(len(a.rows) == 0 ? 0 : a.selected+1) + "/" + io.Sprint(len(a.rows)) + reset;
+    if (a.status != "") { values := lines(a.status); if (len(values) > 0) status = values[0]; }
+    if (a.prompt != "") status = style("confirmation") + (a.prompt == "confirm" ? a.pending + " · type yes: " : a.prompt + ": ") + reset + a.input + "▏";
+    if (a.rebase) status = "\x1b[33mRebase " + cut(a.source,8) + " onto " + cut(a.ref(),8) + "  [s revision / b branch]  enter apply · esc cancel" + reset;
+
+    bindings := string[]{"j/k move", "l details", "p preview", "g git", ": command", "b bookmarks", "/ search", "? help", "q quit"};
+    if (a.mode == "files") bindings = string[]{"j/k move", "s stage", "u unstage", "c commit", "p preview", "esc back", "? help"};
+    if (a.mode == "detail") bindings = string[]{"j/k scroll", "ctrl+d/u half page", "esc back", "q close"};
+    if (a.mode == "help") bindings = string[]{"? close help", "q close help"};
+    badge := painted("status title",fit(" " + a.mode + " ",10));
+    footer := badge + " " + shortcuts(bindings,w-11);
+    if (a.busy) footer = badge + painted("dimmed"," Running Git • waiting for completion");
+    if (a.prompt != "" || a.rebase || a.status != "") footer = status;
+    frame.append(footer);
+    out := "";
+    for (i := 0; i < len(frame) && i < h; i++) {
+        if (i > 0) out += "\n";
+        out += cut(frame[i],w) + reset;
+    }
+    return out;
+}
+func (a *App) commandView() string {
+    w := a.width-1; if (w < 1) w = 1;
+    h := a.height; if (h < 1) h = 1;
+    mw := w < 80 ? w-2 : 78; if (mw < 3) mw = w;
+    mh := h < 40 ? h-2 : 38; if (mh < 3) mh = h;
+    inner := mw-2; if (inner < 1) inner = 1;
+    left := (w-mw)/2; top := (h-mh)/2;
+    count := mh-7; if (count < 0) count = 0;
+    if (a.selected < a.top) a.top = a.selected;
+    if (a.selected >= a.top+count) a.top = a.selected-count+1;
+    if (a.top < 0) a.top = 0;
+    reset := "\x1b[0m"; dim := "\x1b[90m"; out := i8[]{};
+    query := a.commandSearch;
+    // Keep the insertion point visible when the query is wider than the field.
+    for (width(query) > inner-9 && len(query) > 0) {
+        next := 1;
+        for (next < len(query) && (query[next] -> u8) >= 128 && (query[next] -> u8) < 192) next++;
+        query = query[next:];
+    }
+    for (y := 0; y < h; y++) {
+        if (y > 0) out.append(10);
+        row := ""; local := y-top;
+        if (local >= 0 && local < mh) {
+            if (local == 0 || local == mh-1) row = dim + (local == 0 ? "┌" : "└") + repeat("─",mw-2) + (local == 0 ? "┐" : "┘");
+            else {
+                text := "";
+                if (local == 1) text = painted("git title","Git Operations");
+                if (local == 2) text = style("git matched") + "Filter: " + reset + query + (a.prompt == "" ? "\x1b[7m \x1b[0m" : "");
+                if (local == 3) text = dim + io.Sprint(len(a.rows)) + " matching commands";
+                if (local >= 4 && local < mh-3) {
+                    index := a.top+local-4;
+                    if (index < len(a.rows)) text = " " + menuLabel(a.rows[index],a.commandSearch,index == a.selected);
+                    else if (len(a.rows) == 0 && local == 4) text = dim + "No matching commands";
+                }
+                if (local == mh-3 && a.prompt != "") text = style("confirmation") + (a.prompt == "confirm" ? a.pending + " · type yes: " : a.prompt + ": ") + reset + a.input + "\x1b[7m \x1b[0m";
+                if (local == mh-2) text = shortcuts(string[]{"↑/↓ select", "enter apply", "ctrl+u clear", "esc back"},inner);
+                row = dim + "│" + reset + fit(text,inner) + reset + dim + "│";
+            }
+            background := y < len(a.commandBackdrop) ? a.commandBackdrop[y] : "";
+            prefix := cut(background,left);
+            end := cut(background,left+mw);
+            row = dim + fit(prefix,left) + reset + row + reset + dim + background[len(end):];
+        }
+        else if (y < len(a.commandBackdrop)) row = dim + a.commandBackdrop[y];
+        appendText(&out,cut(row,w) + reset);
+    }
+    return out -> string;
+}
+
+func plainText(s string) string {
+    result := i8[]{}; escape := false;
+    for (_, c := range s) {
+        if (c == 27) escape = true;
+        else if (escape) { if (c == 109) escape = false; }
+        else result.append(c);
+    }
+    return result -> string;
+}

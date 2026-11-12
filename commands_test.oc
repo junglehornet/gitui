@@ -1,0 +1,68 @@
+package main;
+import "testing";
+import "term/tui";
+func TestCommandArguments(t *testing.T) {
+    result := gitArguments("commit -m 'a message; $(touch /tmp/no)' ");
+    if (result.hasError() || result.unwrap() != "'commit' '-m' 'a message; $(touch /tmp/no)' ") t.Fatal("arguments were not safely quoted");
+    if (!gitArguments("commit 'unfinished").hasError()) t.Fatal("unclosed quote accepted");
+    if (!gitArguments("").hasError()) t.Fatal("empty command accepted");
+}
+func TestRemoteWizard(t *testing.T) {
+    app := App{}; app.openCommands(); app.selected = 7; app.startCommand();
+    if (app.prompt != "remote name") t.Fatal("missing remote name input");
+    app.input = "upstream"; app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.prompt != "remote URL") t.Fatal("missing URL input");
+    app.input = "/tmp/a repo"; app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.prompt != "confirm" || app.pending != "remote add 'upstream' '/tmp/a repo'") t.Fatal("incorrect remote command");
+    app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.busy || app.prompt != "confirm") t.Fatal("executed without confirmation");
+    app.Update(tui.KeyMsg{Key:"esc"});
+    if (app.prompt != "" || len(app.fields) != 0) t.Fatal("wizard not cancelled");
+}
+func TestGitCommandExecution(t *testing.T) {
+    app := App{};
+    command := app.execute("--version");
+    if (!app.busy) t.Fatal("command not marked running");
+    message := command();
+    switch (done := message.(type)) {
+    case CommandDone:
+        if (done.result.code != 0 || len(done.result.text) < 12) t.Fatal("Git execution failed");
+    default: t.Fatal("incorrect completion message");
+    }
+}
+func TestSearchFocusAndMapping(t *testing.T) {
+    app := App{width:80,height:24};
+    app.Update(tui.KeyMsg{Key:"rune",Text:"g"});
+    app.Update(tui.KeyMsg{Key:"rune",Text:"remote add"});
+    if (app.commandSearch != "remote add" || len(app.rows) != 1 || app.rows[0] != "Add remote") t.Fatal("search not focused or not filtering arguments");
+    app.Update(tui.KeyMsg{Key:"enter"});
+    if (app.pending != "remote add" || app.prompt != "remote name") t.Fatal("filtered row selected the wrong action");
+    app.Update(tui.KeyMsg{Key:"esc"});
+    if (app.commandSearch != "remote add") t.Fatal("cancel lost query");
+    app.Update(tui.KeyMsg{Key:"ctrl+u"});
+    app.Update(tui.KeyMsg{Key:"rune",Text:"PUSH"});
+    if (len(app.rows) < 3) t.Fatal("case-insensitive search failed");
+    app.Update(tui.KeyMsg{Key:"down"});
+    if (app.selected != 1 || app.commandSearch != "PUSH") t.Fatal("arrow changed query");
+    app.Update(tui.KeyMsg{Key:"rune",Text:"zzzz"});
+    app.Update(tui.KeyMsg{Key:"enter"});
+    if (len(app.rows) != 0 || app.prompt != "") t.Fatal("empty results selected a command");
+}
+func TestMenuLettersAreSearch(t *testing.T) {
+    app := App{}; app.openCommands();
+    for (_, text := range string[]{"g","j","k","q",":"}) app.Update(tui.KeyMsg{Key:"rune",Text:text});
+    if (app.commandSearch != "gjkq:" || app.mode != "commands") t.Fatal("global shortcut intercepted search input");
+}
+func TestMenuFrameAndCaret(t *testing.T) {
+    for (_, w := range int[]{1,12,80,160}) {
+        app := App{width:w,height:24}; app.openCommands();
+        rendered := app.View();
+        if (w >= 80 && !containsText(rendered,"Filter: \x1b[0m\x1b[7m ")) t.Fatal("missing focused search caret");
+        row := ""; rows := 1;
+        for (_, c := range rendered) {
+            if (c == 10) { if (width(row) > w) t.Fatal("menu overflows"); row = ""; rows++; }
+            else { byte := i8[]{c}; row += byte -> string; }
+        }
+        if (rows != 24) t.Fatal("wrong menu height");
+    }
+}
